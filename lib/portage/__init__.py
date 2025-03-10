@@ -226,6 +226,13 @@ def _decode_argv(argv):
     return [_unicode_decode(x.encode(fs_encoding, "surrogateescape")) for x in argv]
 
 
+xdigit_regex = re.compile(r"^[0-9A-Fa-f]$")
+
+
+def _is_hex_digit(s):
+    return xdigit_regex.match(s) is not None
+
+
 def _unicode_encode(s, encoding=_encodings["content"], errors="backslashreplace"):
     if isinstance(s, str):
         s = s.encode(encoding, errors)

@@ -1738,6 +1738,9 @@ class vartree:
         self.populated = 1
 
 
+_CONTENTS_VERSION_STRING = "_VERSION: 2"
+
+
 class dblink:
     """
     This class provides an interface to the installed package database
@@ -1752,6 +1755,14 @@ class dblink:
         + r"(?P<obj>(obj) (.+) (\S+) (\d+))|"
         + r"(?P<sym>(sym) (.+) -> (.+) ((\d+)|(?P<oldsym>("
         + r"\(\d+, \d+L, \d+L, \d+, \d+, \d+, \d+L, \d+, (\d+), \d+\)))))"
+        + r")$"
+    )
+
+    _contents_re_v2 = re.compile(
+        r"^("
+        + r"(?P<dir>(dev|dir|fif) ('(?:[^'\\]|\\.)+'))|"
+        + r"(?P<obj>(obj) ('(?:[^'\\]|\\.)+') (\S+) (\d+))|"
+        + r"(?P<sym>(sym) ('(?:[^'\\]|\\.)+') -> ('(?:[^'\\]|\\.)+') (\d+))"
         + r")$"
     )
 
@@ -2023,13 +2034,22 @@ class dblink:
 
         null_byte = "\0"
         normalize_needed = self._normalize_needed
-        contents_re = self._contents_re
+        if mylines[0].rstrip("\n") == _CONTENTS_VERSION_STRING:
+            contents_re = self._contents_re_v2
+            oldsym_index = None
+            unquote_filename = _unquote_filename
+            mylines = mylines[1:]
+            line_offset = 2
+        else:
+            # The old symlink format may exist on systems that have packages
+            # which were installed many years ago (see bug #351814).
+            contents_re = self._contents_re
+            oldsym_index = contents_re.groupindex["oldsym"]
+            unquote_filename = lambda f: f
+            line_offset = 1
         obj_index = contents_re.groupindex["obj"]
         dir_index = contents_re.groupindex["dir"]
         sym_index = contents_re.groupindex["sym"]
-        # The old symlink format may exist on systems that have packages
-        # which were installed many years ago (see bug #351814).
-        oldsym_index = contents_re.groupindex["oldsym"]
         # CONTENTS files already contain EPREFIX
         myroot = self.settings["ROOT"]
         if myroot == os.path.sep:
@@ -2042,12 +2062,14 @@ class dblink:
         for pos, line in enumerate(mylines):
             if null_byte in line:
                 # Null bytes are a common indication of corruption.
-                errors.append((pos + 1, _("Null byte found in CONTENTS entry")))
+                errors.append(
+                    (pos + line_offset, _("Null byte found in CONTENTS entry"))
+                )
                 continue
             line = line.rstrip("\n")
             m = contents_re.match(line)
             if m is None:
-                errors.append((pos + 1, _("Unrecognized CONTENTS entry")))
+                errors.append((pos + line_offset, _("Unrecognized CONTENTS entry")))
                 continue
 
             if m.group(obj_index) is not None:
@@ -2060,12 +2082,15 @@ class dblink:
                 data = (m.group(base + 1),)
             elif m.group(sym_index) is not None:
                 base = sym_index
-                if m.group(oldsym_index) is None:
-                    mtime = m.group(base + 5)
+                if oldsym_index is None:
+                    mtime = m.group(base + 4)
                 else:
-                    mtime = m.group(base + 8)
+                    if m.group(oldsym_index) is None:
+                        mtime = m.group(base + 5)
+                    else:
+                        mtime = m.group(base + 8)
                 # format: type, mtime, dest
-                data = (m.group(base + 1), mtime, m.group(base + 3))
+                data = (m.group(base + 1), mtime, unquote_filename(m.group(base + 3)))
             else:
                 # This won't happen as long the regular expression
                 # is written to only match valid entries.
@@ -2073,7 +2098,7 @@ class dblink:
                     _("required group not found " + "in CONTENTS entry: '%s'") % line
                 )
 
-            path = m.group(base + 2)
+            path = unquote_filename(m.group(base + 2))
             if normalize_needed.search(path) is not None:
                 path = normalize_path(path)
                 if not path.startswith(os.path.sep):
@@ -5303,6 +5328,7 @@ class dblink:
             encoding=_encodings["repo.content"],
             errors="backslashreplace",
         )
+        outfile.write(_CONTENTS_VERSION_STRING + "\n")
 
         # Don't bump mtimes on merge since some application require
         # preservation of timestamps.  This means that the unmerge phase must
@@ -5641,8 +5667,8 @@ class dblink:
                     outfile.write(
                         self._format_contents_line(
                             node_type="sym",
-                            abs_path=myrealdest,
-                            symlink_target=myto,
+                            abs_path=quote_filename(myrealdest),
+                            symlink_target=quote_filename(myto),
                             mtime_ns=mymtime,
                         )
                     )
@@ -5784,7 +5810,9 @@ class dblink:
                     pass
 
                 outfile.write(
-                    self._format_contents_line(node_type="dir", abs_path=myrealdest)
+                    self._format_contents_line(
+                        node_type="dir", abs_path=quote_filename(myrealdest)
+                    )
                 )
                 # recurse and merge this directory
                 mergelist.extend(
@@ -5855,7 +5883,7 @@ class dblink:
                     outfile.write(
                         self._format_contents_line(
                             node_type="obj",
-                            abs_path=myrealdest,
+                            abs_path=quote_filename(myrealdest),
                             md5_digest=mymd5,
                             mtime_ns=mymtime,
                         )
@@ -5888,11 +5916,15 @@ class dblink:
                         return 1
                 if stat.S_ISFIFO(mymode):
                     outfile.write(
-                        self._format_contents_line(node_type="fif", abs_path=myrealdest)
+                        self._format_contents_line(
+                            node_type="fif", abs_path=quote_filename(myrealdest)
+                        )
                     )
                 else:
                     outfile.write(
-                        self._format_contents_line(node_type="dev", abs_path=myrealdest)
+                        self._format_contents_line(
+                            node_type="dev", abs_path=quote_filename(myrealdest)
+                        )
                     )
                 showMessage(zing + " " + mydest + "\n")
 
@@ -6408,20 +6440,93 @@ def unmerge(
             mylink.unlockdb()
 
 
+def _unquote_filename(filename):
+    """
+    unquotes a filename using single quotes. All non-printable values are
+    unicode escaped.
+    """
+
+    if filename[0] != "'" or filename[-1] != "'":
+        raise ValueError("input string not properly quoted")
+    unquoted_string = ""
+    fl = len(filename) - 1
+    i = 1
+    while i < fl:
+        c = filename[i]
+        if c == "\\":
+            if i + 1 >= fl:
+                raise ValueError(f"Unexpected escape character at column {i + 1}")
+            c = filename[(i := i + 1)]
+            if c == "'" or "\\":
+                unquoted_string += c
+            elif c == "u" or c == "U":
+                num_digits = 4 + 4 * (c == "U")
+                if i + num_digits >= fl:
+                    raise ValueError(f"Unexpected unicode escape at column {i + 1}")
+                code_point = 0
+                j = 0
+                while j < num_digits:
+                    code_point *= 16
+                    if not _is_hex_digit(filename[j]):
+                        raise ValueError(
+                            f"Unexpected non-hex digit {c} at column {i + 1}"
+                        )
+                    else:
+                        code_point += int(filename[j], 16)
+                    j += 1
+                try:
+                    unquoted_string += chr(code_point)
+                except Exception as e:
+                    raise ValueError(
+                        f"Invalid Unicode codepoint value ({code_point}) at column {i + 1}"
+                    )
+            else:
+                unquoted_string += f"\\{c}"
+        else:
+            unquoted_string += c
+        i += 1
+    return unquoted_string
+
+
+def quote_filename(filename):
+    """
+    Quotes a filename using single quotes. All non-printable values are unicode
+    escaped.
+    """
+    # This is easier to read using a foreach loop than it is with list
+    # comprehension.
+    quoted_filename = "'"
+    for c in filename:
+        if c.isprintable():
+            if c not in ["'", "\\"]:
+                quoted_filename += c
+            else:
+                quoted_filename += f"\\{c}"
+        else:
+            if ord(c) <= 0xFFFF:
+                quoted_filename += f"\\u{ord(c):04x}"
+            else:
+                quoted_filename += f"\\U{ord(c):08x}"
+    quoted_filename += "'"
+    return quoted_filename
+
+
 def write_contents(contents, root, f):
     """
     Write contents to any file like object. The file will be left open.
     """
+    f.write(_CONTENTS_VERSION_STRING + "\n")
     root_len = len(root) - 1
     for filename in sorted(contents):
         entry_data = contents[filename]
         entry_type = entry_data[0]
-        relative_filename = filename[root_len:]
+        relative_filename = quote_filename(filename[root_len:])
         if entry_type == "obj":
             entry_type, mtime, md5sum = entry_data
             line = f"{entry_type} {relative_filename} {md5sum} {mtime}\n"
         elif entry_type == "sym":
             entry_type, mtime, link = entry_data
+            link = quote_filename(link)
             line = f"{entry_type} {relative_filename} -> {link} {mtime}\n"
         else:  # dir, dev, fif
             line = f"{entry_type} {relative_filename}\n"
