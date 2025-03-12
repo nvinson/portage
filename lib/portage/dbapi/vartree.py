@@ -101,6 +101,7 @@ import gc
 import grp
 import io
 from itertools import chain
+import json
 import logging
 import multiprocessing
 import os as _os
@@ -1342,7 +1343,7 @@ class vardbapi(dbapi):
             for entry in new_needed:
                 f.write(str(entry))
             f.close()
-        f = atomic_ofstream(os.path.join(pkg.dbdir, "CONTENTS"))
+        f = atomic_ofstream(os.path.join(pkg.dbdir, "CONTENTS.json"))
         write_contents(new_contents, root, f)
         f.close()
         self._bump_mtime(pkg.mycpv)
@@ -1997,14 +1998,88 @@ class dblink:
         self._contents_basenames = None
         self._contents.clear_cache()
 
-    def getcontents(self):
-        """
-        Get the installed files of a given package (aka what that package installed)
-        """
-        if self.contentscache is not None:
-            return self.contentscache
-        contents_file = os.path.join(self.dbdir, "CONTENTS")
+    def _get_json_contents(self):
         pkgfiles = {}
+        contents_file = os.path.join(self.dbdir, "CONTENTS.json")
+        try:
+            contents_list = json.load(
+                open(
+                    _unicode_encode(
+                        contents_file, encoding=_encodings["fs"], errors="strict"
+                    ),
+                    encoding=_encodings["repo.content"],
+                    errors="replace",
+                )
+            )
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+            return None
+
+        null_byte = "\0"
+        # CONTENTS files already contain EPREFIX
+        myroot = self.settings["ROOT"]
+        if myroot == os.path.sep:
+            myroot = None
+        # used to generate parent dir entries
+        dir_entry = ("dir",)
+        eroot_split_len = len(self.settings["EROOT"].split(os.sep)) - 1
+        pos = 0
+        errors = []
+        for entry in contents_list:
+            for key, value in entry:
+                if null_byte in key or null_byte in value:
+                    # Null bytes are a common indication of corruption.
+                    errors.append(
+                        _("Null byte found in CONTENTS entry: ") + json.dumps(entry)
+                    )
+            if entry["type"] == "obj":
+                # format: type, mtime, md5sum
+                data = (entry["type"], entry["mtime"], entry["md5sum"])
+            elif entry["type"] == "sym":
+                # format: type, mtime, target
+                data = (entry["type"], entry["mtime"], entry["target"])
+            elif entry["type"] in ["dev", "dir", "fif"]:
+                data = (entry["type"],)
+            else:
+                raise AssertionError(
+                    _("required group not found " + "in CONTENTS entry: '%s'")
+                    % json.dumps(entry)
+                )
+            path = entry["filename"]
+            if normalize_needed.search(path) is not None:
+                path = normalize_path(path)
+                if not path.startswith(os.path.sep):
+                    path = os.path.sep + path
+
+            if myroot is not None:
+                path = os.path.join(myroot, path.lstrip(os.path.sep))
+
+            # Implicitly add parent directories, since we can't necessarily
+            # assume that they are explicitly listed in CONTENTS, and it's
+            # useful for callers if they can rely on parent directory entries
+            # being generated here (crucial for things like dblink.isowner()).
+            path_split = path.split(os.sep)
+            path_split.pop()
+            while len(path_split) > eroot_split_len:
+                parent = os.sep.join(path_split)
+                if parent in pkgfiles:
+                    break
+                pkgfiles[parent] = dir_entry
+                path_split.pop()
+
+            pkgfiles[path] = data
+
+        if errors:
+            writemsg(_("!!! Parse error in '%s'\n") % contents_file, noiselevel=-1)
+            for pos, e in errors:
+                writemsg(_("!!!   line %d: %s\n") % (pos, e), noiselevel=-1)
+        self.contentscache = pkgfiles
+        return pkgfiles
+
+    def _get_legacy_contents(self):
+        pkgfiles = {}
+        contents_file = os.path.join(self.dbdir, "CONTENTS")
         try:
             with open(
                 _unicode_encode(
@@ -2017,9 +2092,7 @@ class dblink:
         except OSError as e:
             if e.errno != errno.ENOENT:
                 raise
-            del e
-            self.contentscache = pkgfiles
-            return pkgfiles
+            return None
 
         null_byte = "\0"
         normalize_needed = self._normalize_needed
@@ -2027,6 +2100,7 @@ class dblink:
         obj_index = contents_re.groupindex["obj"]
         dir_index = contents_re.groupindex["dir"]
         sym_index = contents_re.groupindex["sym"]
+
         # The old symlink format may exist on systems that have packages
         # which were installed many years ago (see bug #351814).
         oldsym_index = contents_re.groupindex["oldsym"]
@@ -2102,6 +2176,25 @@ class dblink:
             for pos, e in errors:
                 writemsg(_("!!!   line %d: %s\n") % (pos, e), noiselevel=-1)
         self.contentscache = pkgfiles
+        return pkgfiles
+
+    def getcontents(self):
+        """
+        Get the installed files of a given package (aka what that package installed)
+        """
+        if self.contentscache is not None:
+            return self.contentscache
+
+        pkgfiles = _get_json_contents()
+        if pkgfiles is None:
+            self.contentscache = {}
+            return self.contentscache
+
+        pkgfiles = _get_legacy_contents()
+        if pkgfiles is None:
+            self.contentscache = {}
+            return self.contentscache
+
         return pkgfiles
 
     def quickpkg(
@@ -3678,7 +3771,7 @@ class dblink:
                 parent_dir = os.path.dirname(parent_dir)
                 if prev == parent_dir:
                     break
-        outfile = atomic_ofstream(os.path.join(self.dbtmpdir, "CONTENTS"))
+        outfile = atomic_ofstream(os.path.join(self.dbtmpdir, "CONTENTS.json"))
         write_contents(new_contents, root, outfile)
         outfile.close()
         self._clear_contents_cache()
@@ -6413,19 +6506,29 @@ def write_contents(contents, root, f):
     Write contents to any file like object. The file will be left open.
     """
     root_len = len(root) - 1
+
+    output = []
     for filename in sorted(contents):
-        entry_data = contents[filename]
-        entry_type = entry_data[0]
+        entry = {}
         relative_filename = filename[root_len:]
+        entry_data = (*contents[filename], relative_filename)
+        entry_type = entry_data[0]
         if entry_type == "obj":
-            entry_type, mtime, md5sum = entry_data
-            line = f"{entry_type} {relative_filename} {md5sum} {mtime}\n"
+            entry["type"], entry["mtime"], entry["md5sum"], entry["filename"] = (
+                entry_data
+            )
         elif entry_type == "sym":
-            entry_type, mtime, link = entry_data
-            line = f"{entry_type} {relative_filename} -> {link} {mtime}\n"
+            entry["type"], entry["mtime"], entry["target"], entry["filename"] = (
+                entry_data
+            )
         else:  # dir, dev, fif
-            line = f"{entry_type} {relative_filename}\n"
-        f.write(line)
+            entry["type"], entry["filename"] = entry_data
+        output.append(entry)
+
+    encoder = json.JSONEncoder(indent=1, sort_keys=True)
+    for chunk in encoder.iterencode(output):
+        f.write(chunk)
+    f.write("\n")
 
 
 def tar_contents(contents, root, tar, protect=None, onProgress=None, xattrs=False):
