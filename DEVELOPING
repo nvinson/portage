@@ -14,9 +14,10 @@ Python 3.9 is the minimum supported version.
 Dependencies
 ------------
 
-Python and Bash should be the only hard dependencies. Any other
-dependencies, including external Python modules that are not included
-with Python itself, must be optionally enabled by runtime detection.
+Python, libarchive, python-libarchive-c, and Bash should be the only hard
+dependencies.  Any other dependencies, including external Python modules that
+are not included with Python itself, must be optionally enabled by runtime
+detection.
 
 Tabs
 ----
